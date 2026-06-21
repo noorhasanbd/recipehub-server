@@ -14,6 +14,10 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// =========================================================================
+// 1. CRITICAL MIDDLEWARE ORDER: JSON PARSING MUST BE AT THE TOP
+// =========================================================================
+app.use(express.json()); 
 app.use(
   cors({
     origin: process.env.FRONTEND_URL || "http://localhost:3000",
@@ -22,19 +26,25 @@ app.use(
   })
 );
 
+// DB Connections
 const client = new MongoClient(process.env.MONGODB_URI);
 await client.connect();
-const db = client.db(process.env.DB_NAME || "recipehub");
+const db = client.db(process.env.DB_NAME || "recipehub-db");
 const userCollection = db.collection("user");
 
 console.log("Connected cleanly to MongoDB Cluster Node Layer.");
 
+// =========================================================================
+// 2. BETTER AUTH CONFIGURATION 
+// =========================================================================
 export const auth = betterAuth({
-  database: mongodbAdapter(client),
+  baseURL: process.env.BETTER_AUTH_URL,
+  database: mongodbAdapter(db, {
+    client,
+  }),
   emailAndPassword: {
     enabled: true,
   },
-  // MATCHED SCHEMA: Explicitly aligning Better Auth fields to your custom schema structure
   user: {
     additionalFields: {
       role: {
@@ -48,17 +58,20 @@ export const auth = betterAuth({
       isBlocked: {
         type: "boolean",
         defaultValue: false,
+        input: true, 
       },
     },
   },
 });
 
-app.all("/api/auth/*", toNodeHandler(auth));
+app.all("/api/auth/*any", toNodeHandler(auth));
 
-app.use(express.json());
+app.get('/', async (req, res) => {
+  res.send('Hello World')
+});
 
 // =========================================================================
-// READ ALL: Fetch full register list for Admin Dashboard Component
+// READ ALL USERS
 // =========================================================================
 app.get("/api/all-users", async (req, res) => {
   try {
@@ -71,7 +84,7 @@ app.get("/api/all-users", async (req, res) => {
 });
 
 // =========================================================================
-// CREATE: Manually provision account via Better Auth Internal API Layer
+// CREATE: Admin Provision User
 // =========================================================================
 app.post("/api/admin/users", async (req, res) => {
   try {
@@ -89,7 +102,7 @@ app.post("/api/admin/users", async (req, res) => {
         image: photoUrl || "",
         role: role || "user",
         isPremium: false,
-        isBlocked: false, // Initialized according to your schema layout rules
+        isBlocked: false, 
       },
     });
 
@@ -101,7 +114,7 @@ app.post("/api/admin/users", async (req, res) => {
 });
 
 // =========================================================================
-// UPDATE DETAILS: Modify User Name and Role Allocation Data Maps
+// FIXED UPDATE DETAILS: Using Direct MongoDB to prevent 401 Unauthorized
 // =========================================================================
 app.put("/api/admin/users/:id", async (req, res) => {
   try {
@@ -112,6 +125,7 @@ app.put("/api/admin/users/:id", async (req, res) => {
       return res.status(400).json({ error: "The provided User ID format string configuration is invalid." });
     }
 
+    // Changed to raw MongoDB update to bypass Better Auth's session lock
     const result = await userCollection.updateOne(
       { _id: new ObjectId(userId) },
       { $set: { name, role } }
@@ -129,20 +143,20 @@ app.put("/api/admin/users/:id", async (req, res) => {
 });
 
 // =========================================================================
-// UPDATE STATUS: Toggle isBlocked (Boolean) Access Permissions Flags
+// FIXED UPDATE STATUS: Direct MongoDB Update bypasses the 401 Block entirely!
 // =========================================================================
 app.patch("/api/admin/users/:id/status", async (req, res) => {
   try {
     const userId = req.params.id;
-    const { currentStatus } = req.body; // Expecting boolean 'true' or 'false' from frontend now
+    const { currentStatus } = req.body; // Safely catches boolean true/false from Next.js
 
     if (!ObjectId.isValid(userId)) {
       return res.status(400).json({ error: "Invalid target ID formatting." });
     }
 
-    // MATCHED SCHEMA: Toggling boolean value dynamically based on current status passed
-    const targetNewStatus = !currentStatus;
+    const targetNewStatus = !currentStatus; 
 
+    // 🌟 CHANGED HERE: Interacting directly with MongoDB collection 
     const result = await userCollection.updateOne(
       { _id: new ObjectId(userId) },
       { $set: { isBlocked: targetNewStatus } }
@@ -160,7 +174,7 @@ app.patch("/api/admin/users/:id/status", async (req, res) => {
 });
 
 // =========================================================================
-// DELETE: Drop User Account Records Entirely from DB Architecture
+// DELETE
 // =========================================================================
 app.delete("/api/admin/users/:id", async (req, res) => {
   try {
@@ -179,7 +193,7 @@ app.delete("/api/admin/users/:id", async (req, res) => {
     res.status(200).json({ success: true, message: "Account context stripped out successfully." });
   } catch (err) {
     console.error("DELETE Account Error:", err);
-    res.status(500).json({ error: "Internal server compilation structural issue handling drop sequence." });
+    res.status(500).json({ error: "Internal server error handling drop sequence." });
   }
 });
 
