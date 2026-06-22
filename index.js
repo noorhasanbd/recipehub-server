@@ -520,6 +520,188 @@ app.get("/api/recipes/user/:userId", async (req, res) => {
       count: userRecipes.length,
       data: userRecipes,
     });
+
+    // =========================================================================
+    // REPORTS CRUD ENDPOINTS (SECURED WITH BETTER AUTH MIDDLEWARE)
+    // =========================================================================
+
+    /**
+     * CREATE: User submits a report ticket (Protected via session cookie)
+     * POST /api/reports
+     */
+    app.post("/api/reports", isAuthenticated, async (req, res) => {
+      try {
+        const { targetType, targetId, targetName, reason, details } = req.body;
+
+        // Securely read identity details directly out of your Better Auth user session interceptor
+        const reporterId = req.user.id;
+        const reporterName = req.user.name;
+
+        if (!targetType || !targetId || !reason || !details) {
+          return res.status(400).json({
+            success: false,
+            error: "Validation failed: Missing required report fields.",
+          });
+        }
+
+        const newReport = {
+          reporterId,
+          reporterName,
+          targetType, // 'recipe' | 'comment' | 'user'
+          targetId,
+          targetName,
+          reason,
+          details,
+          status: "pending", // 'pending' | 'resolved' | 'dismissed'
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await reportCollection.insertOne(newReport);
+
+        res.status(201).json({
+          success: true,
+          data: { _id: result.insertedId, ...newReport },
+        });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    /**
+     * READ: Get personal report history for the current session user
+     * GET /api/reports/my-history
+     */
+    app.get("/api/reports/my-history", isAuthenticated, async (req, res) => {
+      try {
+        const userId = req.user.id; // Safe context identifier from middleware
+
+        const userReports = await reportCollection
+          .find({ reporterId: userId })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res
+          .status(200)
+          .json({
+            success: true,
+            count: userReports.length,
+            data: userReports,
+          });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    /**
+     * READ: Get all system reports with status filtering (Admin Dashboard View)
+     * GET /api/reports
+     */
+    app.get("/api/reports", async (req, res) => {
+      try {
+        const { status } = req.query;
+        const filters = {};
+
+        if (status && status !== "all") {
+          filters.status = status;
+        }
+
+        const reports = await reportCollection
+          .find(filters)
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res
+          .status(200)
+          .json({ success: true, count: reports.length, data: reports });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    /**
+     * UPDATE: Update report tracking status matrices (Admin Action)
+     * PATCH /api/reports/:id/status
+     */
+    app.patch("/api/reports/:id/status", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body; // expected: "resolved" or "dismissed"
+
+        if (!ObjectId.isValid(id)) {
+          return res
+            .status(400)
+            .json({ success: false, error: "Invalid Report ID formatting." });
+        }
+
+        if (!["resolved", "dismissed", "pending"].includes(status)) {
+          return res
+            .status(400)
+            .json({
+              success: false,
+              error: "Invalid target status type parameter.",
+            });
+        }
+
+        const result = await reportCollection.findOneAndUpdate(
+          { _id: new ObjectId(id) },
+          { $set: { status, updatedAt: new Date() } },
+          { returnDocument: "after" },
+        );
+
+        const updatedDoc = result.value || result;
+        if (!updatedDoc) {
+          return res
+            .status(404)
+            .json({
+              success: false,
+              error: "Target report log layer missing.",
+            });
+        }
+
+        res.status(200).json({ success: true, data: updatedDoc });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    /**
+     * DELETE: Withdraw/Cancel an open pending user report record cleanly
+     * DELETE /api/reports/:id
+     */
+    app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const userId = req.user.id; // Session locked context ID
+
+        if (!ObjectId.isValid(id)) {
+          return res
+            .status(400)
+            .json({ success: false, error: "Invalid Report ID formatting." });
+        }
+
+        // Restricts regular users to only deleting their own PENDING tickets
+        const result = await reportCollection.deleteOne({
+          _id: new ObjectId(id),
+          reporterId: userId,
+          status: "pending",
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            error:
+              "Report record could not be canceled. It may have already been resolved by admins.",
+          });
+        }
+
+        res
+          .status(200)
+          .json({ success: true, message: "Report successfully withdrawn." });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
   } catch (error) {
     console.error(
       "Express API [/api/recipes/user/:userId] Error:",
