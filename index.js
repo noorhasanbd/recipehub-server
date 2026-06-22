@@ -494,6 +494,43 @@ app.delete("/api/admin/users/:id", async (req, res) => {
   }
 });
 
+// =========================================================================
+// READ: Get All Recipes for a Specific User (Optimized Native Driver Query)
+// GET /api/recipes/user/:userId
+// =========================================================================
+app.get("/api/recipes/user/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required parameter: userId",
+      });
+    }
+
+    // 🌟 Matches 'authorId' stored inside your recipe collection records
+    const userRecipes = await recipeCollection
+      .find({ authorId: userId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      count: userRecipes.length,
+      data: userRecipes,
+    });
+  } catch (error) {
+    console.error("Express API [/api/recipes/user/:userId] Error:", error.message);
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error occurred while compiling personal recipes.",
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Backend Express Hub running smoothly on port: ${PORT}`);
 });
+
+
