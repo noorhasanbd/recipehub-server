@@ -21,10 +21,9 @@ const PORT = process.env.PORT || 5000;
 app.use(express.json());
 app.use(
   cors({
-    // 🌟 MUST be explicit (no wildcards) when passing secure cookies across origins
     origin: process.env.FRONTEND_URL || "http://localhost:3000",
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
-    credentials: true,
+    credentials: true, // Allows secure cookie tokens to cross origin boundaries
   }),
 );
 
@@ -72,10 +71,25 @@ export const auth = betterAuth({
 app.all("/api/auth/*any", toNodeHandler(auth));
 
 // 🌟 BACKEND MIDDLEWARE: Intercepts requests, validates cookies against Better Auth
+// 🌟 UPDATED BACKEND MIDDLEWARE: Handles Server Action requests perfectly
 const isAuthenticated = async (req, res, next) => {
   try {
+    // 1. Manually check if cookies exist in the request headers
+    const rawCookie = req.headers.cookie || "";
+
+    // 2. Build a standard Web API Headers object that Better Auth loves
+    const webHeaders = new Headers();
+    if (rawCookie) {
+      webHeaders.append("Cookie", rawCookie);
+    }
+    // Forward authorization headers if present
+    if (req.headers.authorization) {
+      webHeaders.append("Authorization", req.headers.authorization);
+    }
+
+    // 3. Pass the clean Web Headers object directly into Better Auth
     const session = await auth.api.getSession({
-      headers: req.headers, // Extracts cookies forwarded from Next.js server actions
+      headers: webHeaders,
     });
 
     if (!session || !session.user) {
@@ -89,6 +103,7 @@ const isAuthenticated = async (req, res, next) => {
     req.user = session.user;
     next();
   } catch (error) {
+    console.error("Express Auth Middleware Error:", error);
     return res
       .status(500)
       .json({ success: false, error: "Internal Auth verification failure." });
@@ -104,20 +119,13 @@ app.get("/", async (req, res) => {
 // =========================================================================
 
 /**
- * CREATE: Add New Recipe Record (Protected with middleware)
- * POST /api/recipes
- */
-/**
  * CREATE: Add New Recipe Record using explicit body payload session tracking
  * POST /api/recipes
  */
-// 🌟 NOTICE: No "isAuthenticated" cookie-dependent middleware on this route!
 app.post("/api/recipes", async (req, res) => {
   try {
-    // 🌟 Extract the explicitly forwarded clientUser object from the request body
     const activeUser = req.body.clientUser;
 
-    // Fail early if the frontend block didn't submit user credentials
     if (!activeUser) {
       return res.status(401).json({
         success: false,
@@ -125,12 +133,10 @@ app.post("/api/recipes", async (req, res) => {
       });
     }
 
-    // Deconstruct the payload to remove "clientUser" so it doesn't leak into the database document
     const { clientUser, ...recipeData } = req.body;
 
     const newRecipe = {
       ...recipeData,
-      // Assign the explicitly verified details to the MongoDB schema mapping
       authorId: activeUser.id,
       authorName: activeUser.name,
       authorEmail: activeUser.email,
@@ -150,15 +156,15 @@ app.post("/api/recipes", async (req, res) => {
     res.status(400).json({ success: false, error: error.message });
   }
 });
+
 /**
  * READ: Get All Recipes (With Dynamic Query Filtering)
  * GET /api/recipes
  */
 app.get("/api/recipes", async (req, res) => {
   try {
-    // 1. Extract and parse pagination controls from Next.js query strings
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 5; // Default to exactly 5 items per page
+    const limit = parseInt(req.query.limit) || 5;
     const skip = (page - 1) * limit;
 
     const {
@@ -169,7 +175,7 @@ app.get("/api/recipes", async (req, res) => {
       status,
       isFeatured,
     } = req.query;
-    
+
     const filters = {};
 
     if (category) filters.category = category;
@@ -179,10 +185,8 @@ app.get("/api/recipes", async (req, res) => {
     if (status) filters.status = status;
     if (isFeatured) filters.isFeatured = isFeatured === "true";
 
-    // 2. Fetch total items matching the filter configuration before slicing
     const totalItems = await recipeCollection.countDocuments(filters);
 
-    // 3. Query MongoDB using skip and limit to load only the 5 specific documents
     const recipes = await recipeCollection
       .find(filters)
       .sort({ createdAt: -1 })
@@ -190,20 +194,18 @@ app.get("/api/recipes", async (req, res) => {
       .limit(limit)
       .toArray();
 
-    // 4. Calculate total dynamic pages based on total records
     const totalPages = Math.ceil(totalItems / limit);
 
-    // 5. Return structured payload containing both requested slice data and pagination metadata
-    res.status(200).json({ 
-      success: true, 
-      count: recipes.length, 
+    res.status(200).json({
+      success: true,
+      count: recipes.length,
       data: recipes,
       pagination: {
         currentPage: page,
         totalPages: totalPages || 1,
         totalItems: totalItems || 0,
-        limit
-      }
+        limit,
+      },
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -235,7 +237,7 @@ app.get("/api/recipes/:id", async (req, res) => {
 });
 
 /**
- * UPDATE: Modify General Recipe Information
+ * UPDATE: Modify General Recipe Information (Protected)
  * PUT /api/recipes/:id
  */
 app.put("/api/recipes/:id", isAuthenticated, async (req, res) => {
@@ -246,7 +248,6 @@ app.put("/api/recipes/:id", isAuthenticated, async (req, res) => {
         .status(400)
         .json({ success: false, error: "Invalid ID format pattern string." });
 
-    // Separate critical metadata properties to prevent over-writing original creation values
     const {
       authorId,
       authorName,
@@ -314,7 +315,7 @@ app.patch("/api/recipes/:id/like", async (req, res) => {
 });
 
 /**
- * DELETE: Permanent Eviction
+ * DELETE: Permanent Eviction (Protected)
  * DELETE /api/recipes/:id
  */
 app.delete("/api/recipes/:id", isAuthenticated, async (req, res) => {
@@ -495,7 +496,7 @@ app.delete("/api/admin/users/:id", async (req, res) => {
 });
 
 // =========================================================================
-// READ: Get All Recipes for a Specific User (Optimized Native Driver Query)
+// READ: Get All Recipes for a Specific User
 // GET /api/recipes/user/:userId
 // =========================================================================
 app.get("/api/recipes/user/:userId", async (req, res) => {
@@ -509,7 +510,6 @@ app.get("/api/recipes/user/:userId", async (req, res) => {
       });
     }
 
-    // 🌟 Matches 'authorId' stored inside your recipe collection records
     const userRecipes = await recipeCollection
       .find({ authorId: userId })
       .sort({ createdAt: -1 })
@@ -521,7 +521,10 @@ app.get("/api/recipes/user/:userId", async (req, res) => {
       data: userRecipes,
     });
   } catch (error) {
-    console.error("Express API [/api/recipes/user/:userId] Error:", error.message);
+    console.error(
+      "Express API [/api/recipes/user/:userId] Error:",
+      error.message,
+    );
     res.status(500).json({
       success: false,
       error: "Internal Server Error occurred while compiling personal recipes.",
@@ -532,5 +535,3 @@ app.get("/api/recipes/user/:userId", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Backend Express Hub running smoothly on port: ${PORT}`);
 });
-
-
