@@ -4,6 +4,7 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import Stripe from "stripe";
 
 import { MongoClient, ObjectId } from "mongodb";
 import { betterAuth } from "better-auth";
@@ -14,11 +15,11 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // =========================================================================
-// 1. GLOBAL MIDDLEWARES & CORS FIX
+// 1. GLOBAL CORS FIX
 // =========================================================================
-app.use(express.json());
 app.use(
   cors({
     origin: process.env.FRONTEND_URL || "http://localhost:3000",
@@ -33,21 +34,229 @@ await client.connect();
 const db = client.db(process.env.DB_NAME || "recipehub-db");
 
 // Collections
-const userCollection = db.collection("user");
+const userCollection = db.collection("user"); // Aligned with your system user identity mapping
 const recipeCollection = db.collection("recipes");
+const reportCollection = db.collection("reports");
+const transactionCollection = db.collection("transactions"); // 🌟 NEW ADDITION: For admin revenue visibility logs
 
 console.log("Connected cleanly to MongoDB Cluster Node Layer.");
 
 // =========================================================================
-// 2. BETTER AUTH CONFIGURATION
+// 2. BULLETPROOF STRIPE BACKGROUND WEBHOOK RECEIVER
+// =========================================================================
+// 🌟 CRITICAL: Must be registered BEFORE express.json() to capture raw request buffers!
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const signature = req.headers["stripe-signature"];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (err) {
+      console.error(`❌ Webhook cryptographic validation failed:`, err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const userId = session.metadata?.userId;
+      const stripeSubscriptionId = session.subscription;
+
+      if (userId) {
+        try {
+          // Handles flexible index structural mutations mapping directly to Better-Auth user schema
+          await userCollection.updateOne(
+            {
+              $or: [
+                { _id: userId },
+                { _id: ObjectId.isValid(userId) ? new ObjectId(userId) : null },
+              ].filter(Boolean),
+            },
+            {
+              $set: {
+                isPremium: true,
+                stripeSubscriptionId: stripeSubscriptionId,
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          // 🌟 NEW ADDITION: Log transaction in webhook as fallback security redundancy
+          const webhookTransaction = {
+            userId: userId,
+            customerEmail:
+              session.customer_details?.email || session.customer_email,
+            stripeSessionId: session.id,
+            stripeSubscriptionId: session.subscription,
+            amountTotal: session.amount_total / 100,
+            currency: session.currency?.toUpperCase(),
+            paymentStatus: session.payment_status,
+            createdAt: new Date(),
+          };
+
+          await transactionCollection.updateOne(
+            { stripeSessionId: session.id },
+            { $set: webhookTransaction },
+            { upsert: true },
+          );
+
+          console.log(
+            `💾 MongoDB Webhook Sync Success. User ${userId} upgraded to Premium.`,
+          );
+        } catch (dbErr) {
+          console.error(
+            "❌ Database mutations dropped during webhook processing:",
+            dbErr,
+          );
+          return res
+            .status(500)
+            .json({ error: "Internal database tracking fault." });
+        }
+      }
+    }
+
+    res.status(200).json({ received: true });
+  },
+);
+
+// =========================================================================
+// 3. STANDARD PARSING MIDDLEWARES (Safe down here)
+// =========================================================================
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// =========================================================================
+// 🌟 NEW ADDITION: NEXT.JS SERVER ACTION VERIFICATION ROUTE
+// =========================================================================
+app.post("/api/payments/verify-session", async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+
+    if (!sessionId) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing sessionId parameters" });
+    }
+
+    // 1. Pull the actual object securely directly from Stripe
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const userId = session.metadata?.userId;
+
+    if (!userId) {
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error: "No userId embedded in checkout session metadata",
+        });
+    }
+
+    // 2. Perform target user level modification mutation
+    await userCollection.updateOne(
+      {
+        $or: [
+          { _id: userId },
+          { _id: ObjectId.isValid(userId) ? new ObjectId(userId) : null },
+        ].filter(Boolean),
+      },
+      {
+        $set: {
+          isPremium: true,
+          stripeSubscriptionId: session.subscription,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    // 3. Document explicit transaction log for your upcoming Admin view charts
+    const transactionRecord = {
+      userId: userId,
+      customerEmail: session.customer_details?.email || session.customer_email,
+      stripeSessionId: session.id,
+      stripeSubscriptionId: session.subscription,
+      amountTotal: session.amount_total / 100, // convert from cents to base units
+      currency: session.currency?.toUpperCase(),
+      paymentStatus: session.payment_status,
+      createdAt: new Date(),
+    };
+
+    // Prevent duplicate entries using custom upsert pattern
+    await transactionCollection.updateOne(
+      { stripeSessionId: session.id },
+      { $set: transactionRecord },
+      { upsert: true },
+    );
+
+    console.log(
+      `💾 Express Inline Verification Active. User ${userId} updated & transaction recorded.`,
+    );
+    return res
+      .status(200)
+      .json({ success: true, message: "Database synchronized successfully" });
+  } catch (error) {
+    console.error("❌ Express side verify-session route failure:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =========================================================================
+// 4. STRIPE NATIVE CHECKOUT ENTRYPOINT LINK HANDLER
+// =========================================================================
+app.post("/api/checkout_sessions", async (req, res) => {
+  try {
+    const { customer_email, user_id } = req.body;
+    const origin = process.env.FRONTEND_URL || "http://localhost:3000";
+
+    const sessionConfig = {
+      line_items: [
+        {
+          price: "price_1TlNeQJkZEwDCtQcDHRbZZkz",
+          quantity: 1,
+        },
+      ],
+      mode: "subscription",
+      success_url: `${origin}/pricing/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/pricing?canceled=true`,
+    };
+
+    if (customer_email) sessionConfig.customer_email = customer_email;
+
+    if (user_id) {
+      sessionConfig.metadata = { userId: user_id };
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionConfig);
+    return res.redirect(303, session.url);
+  } catch (err) {
+    console.error("❌ Checkout session creation failure context error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================================================================
+// 5. BETTER AUTH CONFIGURATION (WITH CROSS-ORIGIN MATRIX ALIGNMENT)
 // =========================================================================
 export const auth = betterAuth({
-  baseURL: process.env.BETTER_AUTH_URL,
+  baseURL: process.env.BETTER_AUTH_URL || "http://localhost:5000",
   database: mongodbAdapter(db, {
     client,
   }),
   emailAndPassword: {
     enabled: true,
+  },
+  advanced: {
+    crossOrigin: true,
+  },
+  trustedOrigins: ["http://localhost:3000", "http://localhost:5000"],
+  cookie: {
+    sameSite: "none",
+    secure: false,
   },
   user: {
     additionalFields: {
@@ -64,30 +273,30 @@ export const auth = betterAuth({
         defaultValue: false,
         input: true,
       },
+      stripeSubscriptionId: {
+        type: "string",
+        defaultValue: "",
+      },
     },
   },
 });
 
 app.all("/api/auth/*any", toNodeHandler(auth));
 
-// 🌟 BACKEND MIDDLEWARE: Intercepts requests, validates cookies against Better Auth
-// 🌟 UPDATED BACKEND MIDDLEWARE: Handles Server Action requests perfectly
 const isAuthenticated = async (req, res, next) => {
   try {
-    // 1. Manually check if cookies exist in the request headers
-    const rawCookie = req.headers.cookie || "";
-
-    // 2. Build a standard Web API Headers object that Better Auth loves
     const webHeaders = new Headers();
-    if (rawCookie) {
-      webHeaders.append("Cookie", rawCookie);
-    }
-    // Forward authorization headers if present
-    if (req.headers.authorization) {
-      webHeaders.append("Authorization", req.headers.authorization);
-    }
 
-    // 3. Pass the clean Web Headers object directly into Better Auth
+    Object.entries(req.headers).forEach(([key, value]) => {
+      if (value) {
+        if (Array.isArray(value)) {
+          value.forEach((v) => webHeaders.append(key, v));
+        } else {
+          webHeaders.append(key, value);
+        }
+      }
+    });
+
     const session = await auth.api.getSession({
       headers: webHeaders,
     });
@@ -99,7 +308,6 @@ const isAuthenticated = async (req, res, next) => {
       });
     }
 
-    // Attach verified user instance directly to request wrapper
     req.user = session.user;
     next();
   } catch (error) {
@@ -115,13 +323,8 @@ app.get("/", async (req, res) => {
 });
 
 // =========================================================================
-// 3. RECIPE CRUD ENDPOINTS
+// 6. RECIPE CRUD ENDPOINTS
 // =========================================================================
-
-/**
- * CREATE: Add New Recipe Record using explicit body payload session tracking
- * POST /api/recipes
- */
 app.post("/api/recipes", async (req, res) => {
   try {
     const activeUser = req.body.clientUser;
@@ -157,10 +360,6 @@ app.post("/api/recipes", async (req, res) => {
   }
 });
 
-/**
- * READ: Get All Recipes (With Dynamic Query Filtering)
- * GET /api/recipes
- */
 app.get("/api/recipes", async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -212,10 +411,6 @@ app.get("/api/recipes", async (req, res) => {
   }
 });
 
-/**
- * READ: Get Single Recipe by ID
- * GET /api/recipes/:id
- */
 app.get("/api/recipes/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -236,17 +431,33 @@ app.get("/api/recipes/:id", async (req, res) => {
   }
 });
 
-/**
- * UPDATE: Modify General Recipe Information (Protected)
- * PUT /api/recipes/:id
- */
 app.put("/api/recipes/:id", isAuthenticated, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!ObjectId.isValid(id))
+    if (!ObjectId.isValid(id)) {
       return res
         .status(400)
         .json({ success: false, error: "Invalid ID format pattern string." });
+    }
+
+    const existingRecipe = await recipeCollection.findOne({
+      _id: new ObjectId(id),
+    });
+    if (!existingRecipe) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Target recipe missing." });
+    }
+
+    const isOwner = existingRecipe.authorId === req.user.id;
+    const isAdmin = req.user.role === "admin";
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: "Forbidden: You do not have permission to modify this recipe.",
+      });
+    }
 
     const {
       authorId,
@@ -271,21 +482,12 @@ app.put("/api/recipes/:id", isAuthenticated, async (req, res) => {
     );
 
     const updatedDocument = result.value || result;
-    if (!updatedDocument)
-      return res
-        .status(404)
-        .json({ success: false, error: "Target recipe missing." });
-
     res.status(200).json({ success: true, data: updatedDocument });
   } catch (error) {
     res.status(400).json({ success: false, error: error.message });
   }
 });
 
-/**
- * UPDATE: Atomic Increments for Likes Counter
- * PATCH /api/recipes/:id/like
- */
 app.patch("/api/recipes/:id/like", async (req, res) => {
   try {
     const { id } = req.params;
@@ -314,10 +516,6 @@ app.patch("/api/recipes/:id/like", async (req, res) => {
   }
 });
 
-/**
- * DELETE: Permanent Eviction (Protected)
- * DELETE /api/recipes/:id
- */
 app.delete("/api/recipes/:id", isAuthenticated, async (req, res) => {
   try {
     const { id } = req.params;
@@ -342,7 +540,7 @@ app.delete("/api/recipes/:id", isAuthenticated, async (req, res) => {
 });
 
 // =========================================================================
-// 4. READ ALL USERS
+// 7. USER MANAGEMENT ENDPOINTS
 // =========================================================================
 app.get("/api/all-users", async (req, res) => {
   try {
@@ -356,9 +554,6 @@ app.get("/api/all-users", async (req, res) => {
   }
 });
 
-// =========================================================================
-// 5. CREATE: Admin Provision User
-// =========================================================================
 app.post("/api/admin/users", async (req, res) => {
   try {
     const { name, email, password, photoUrl, role } = req.body;
@@ -390,9 +585,6 @@ app.post("/api/admin/users", async (req, res) => {
   }
 });
 
-// =========================================================================
-// 6. FIXED UPDATE DETAILS
-// =========================================================================
 app.put("/api/admin/users/:id", async (req, res) => {
   try {
     const userId = req.params.id;
@@ -426,9 +618,6 @@ app.put("/api/admin/users/:id", async (req, res) => {
   }
 });
 
-// =========================================================================
-// 7. FIXED UPDATE STATUS
-// =========================================================================
 app.patch("/api/admin/users/:id/status", async (req, res) => {
   try {
     const userId = req.params.id;
@@ -460,9 +649,6 @@ app.patch("/api/admin/users/:id/status", async (req, res) => {
   }
 });
 
-// =========================================================================
-// 8. DELETE USER
-// =========================================================================
 app.delete("/api/admin/users/:id", async (req, res) => {
   try {
     const userId = req.params.id;
@@ -495,10 +681,6 @@ app.delete("/api/admin/users/:id", async (req, res) => {
   }
 });
 
-// =========================================================================
-// READ: Get All Recipes for a Specific User
-// GET /api/recipes/user/:userId
-// =========================================================================
 app.get("/api/recipes/user/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -520,188 +702,6 @@ app.get("/api/recipes/user/:userId", async (req, res) => {
       count: userRecipes.length,
       data: userRecipes,
     });
-
-    // =========================================================================
-    // REPORTS CRUD ENDPOINTS (SECURED WITH BETTER AUTH MIDDLEWARE)
-    // =========================================================================
-
-    /**
-     * CREATE: User submits a report ticket (Protected via session cookie)
-     * POST /api/reports
-     */
-    app.post("/api/reports", isAuthenticated, async (req, res) => {
-      try {
-        const { targetType, targetId, targetName, reason, details } = req.body;
-
-        // Securely read identity details directly out of your Better Auth user session interceptor
-        const reporterId = req.user.id;
-        const reporterName = req.user.name;
-
-        if (!targetType || !targetId || !reason || !details) {
-          return res.status(400).json({
-            success: false,
-            error: "Validation failed: Missing required report fields.",
-          });
-        }
-
-        const newReport = {
-          reporterId,
-          reporterName,
-          targetType, // 'recipe' | 'comment' | 'user'
-          targetId,
-          targetName,
-          reason,
-          details,
-          status: "pending", // 'pending' | 'resolved' | 'dismissed'
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-
-        const result = await reportCollection.insertOne(newReport);
-
-        res.status(201).json({
-          success: true,
-          data: { _id: result.insertedId, ...newReport },
-        });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    /**
-     * READ: Get personal report history for the current session user
-     * GET /api/reports/my-history
-     */
-    app.get("/api/reports/my-history", isAuthenticated, async (req, res) => {
-      try {
-        const userId = req.user.id; // Safe context identifier from middleware
-
-        const userReports = await reportCollection
-          .find({ reporterId: userId })
-          .sort({ createdAt: -1 })
-          .toArray();
-
-        res
-          .status(200)
-          .json({
-            success: true,
-            count: userReports.length,
-            data: userReports,
-          });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    /**
-     * READ: Get all system reports with status filtering (Admin Dashboard View)
-     * GET /api/reports
-     */
-    app.get("/api/reports", async (req, res) => {
-      try {
-        const { status } = req.query;
-        const filters = {};
-
-        if (status && status !== "all") {
-          filters.status = status;
-        }
-
-        const reports = await reportCollection
-          .find(filters)
-          .sort({ createdAt: -1 })
-          .toArray();
-
-        res
-          .status(200)
-          .json({ success: true, count: reports.length, data: reports });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    /**
-     * UPDATE: Update report tracking status matrices (Admin Action)
-     * PATCH /api/reports/:id/status
-     */
-    app.patch("/api/reports/:id/status", async (req, res) => {
-      try {
-        const { id } = req.params;
-        const { status } = req.body; // expected: "resolved" or "dismissed"
-
-        if (!ObjectId.isValid(id)) {
-          return res
-            .status(400)
-            .json({ success: false, error: "Invalid Report ID formatting." });
-        }
-
-        if (!["resolved", "dismissed", "pending"].includes(status)) {
-          return res
-            .status(400)
-            .json({
-              success: false,
-              error: "Invalid target status type parameter.",
-            });
-        }
-
-        const result = await reportCollection.findOneAndUpdate(
-          { _id: new ObjectId(id) },
-          { $set: { status, updatedAt: new Date() } },
-          { returnDocument: "after" },
-        );
-
-        const updatedDoc = result.value || result;
-        if (!updatedDoc) {
-          return res
-            .status(404)
-            .json({
-              success: false,
-              error: "Target report log layer missing.",
-            });
-        }
-
-        res.status(200).json({ success: true, data: updatedDoc });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
-    /**
-     * DELETE: Withdraw/Cancel an open pending user report record cleanly
-     * DELETE /api/reports/:id
-     */
-    app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
-      try {
-        const { id } = req.params;
-        const userId = req.user.id; // Session locked context ID
-
-        if (!ObjectId.isValid(id)) {
-          return res
-            .status(400)
-            .json({ success: false, error: "Invalid Report ID formatting." });
-        }
-
-        // Restricts regular users to only deleting their own PENDING tickets
-        const result = await reportCollection.deleteOne({
-          _id: new ObjectId(id),
-          reporterId: userId,
-          status: "pending",
-        });
-
-        if (result.deletedCount === 0) {
-          return res.status(404).json({
-            success: false,
-            error:
-              "Report record could not be canceled. It may have already been resolved by admins.",
-          });
-        }
-
-        res
-          .status(200)
-          .json({ success: true, message: "Report successfully withdrawn." });
-      } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
   } catch (error) {
     console.error(
       "Express API [/api/recipes/user/:userId] Error:",
@@ -714,6 +714,234 @@ app.get("/api/recipes/user/:userId", async (req, res) => {
   }
 });
 
+// =========================================================================
+// 8. REPORTS CRUD ENDPOINTS
+// =========================================================================
+app.post("/api/reports", isAuthenticated, async (req, res) => {
+  try {
+    const { targetType, targetId, targetName, reason, details } = req.body;
+
+    const reporterId = req.user.id;
+    const reporterName = req.user.name;
+
+    if (!targetType || !targetId || !reason || !details) {
+      return res.status(400).json({
+        success: false,
+        error: "Validation failed: Missing required report fields.",
+      });
+    }
+
+    const newReport = {
+      reporterId,
+      reporterName,
+      targetType,
+      targetId,
+      targetName,
+      reason,
+      details,
+      status: "pending",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await reportCollection.insertOne(newReport);
+
+    res.status(201).json({
+      success: true,
+      data: { _id: result.insertedId, ...newReport },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/api/reports/my-history", isAuthenticated, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const userReports = await reportCollection
+      .find({ reporterId: userId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      count: userReports.length,
+      data: userReports,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/api/reports", async (req, res) => {
+  try {
+    const { status } = req.query;
+    const filters = {};
+
+    if (status && status !== "all") {
+      filters.status = status;
+    }
+
+    const reports = await reportCollection
+      .find(filters)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res
+      .status(200)
+      .json({ success: true, count: reports.length, data: reports });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.patch("/api/reports/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid Report ID formatting." });
+    }
+
+    if (!["resolved", "dismissed", "pending"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid target status type parameter.",
+      });
+    }
+
+    const result = await reportCollection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { status, updatedAt: new Date() } },
+      { returnDocument: "after" },
+    );
+
+    const updatedDoc = result.value || result;
+    if (!updatedDoc) {
+      return res.status(404).json({
+        success: false,
+        error: "Target report log layer missing.",
+      });
+    }
+
+    res.status(200).json({ success: true, data: updatedDoc });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 🌟 UPDATED EXPRESS ENDPOINT: Aggregating Transactions with User Profiles
+app.get("/api/all-transactions", async (req, res) => {
+  try {
+    const pipeline = [
+      // 1. Join user details using a flexible conditional type comparison match
+      {
+        $lookup: {
+          from: "user",
+          let: { trxUserId: "$userId" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    // Match case A: Both are matching standard Strings (e.g., user.id === transaction.userId)
+                    { $eq: ["$id", "$$trxUserId"] },
+                    // Match case B: Convert the transaction string to an ObjectId to compare against user._id
+                    {
+                      $eq: [
+                        "$_id",
+                        {
+                          $convert: {
+                            input: "$$trxUserId",
+                            to: "objectId",
+                            onError: null, // If conversion fails (e.g. invalid format), returns null cleanly
+                            onNull: null
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          ],
+          as: "userDetails"
+        }
+      },
+      // 2. Unwind the userDetails array
+      {
+        $unwind: {
+          path: "$userDetails",
+          preserveNullAndEmptyArrays: true
+        }
+      },
+      // 3. Reshape output data structures
+      {
+        $project: {
+          _id: 1,
+          userId: 1,
+          customerEmail: 1,
+          stripeSessionId: 1,
+          stripeSubscriptionId: 1,
+          amountTotal: 1,
+          currency: 1,
+          paymentStatus: 1,
+          createdAt: 1,
+          // Extract user name cleanly or fall back gracefully
+          userName: { $ifNull: ["$userDetails.name", "Unknown User"] }
+        }
+      },
+      { $sort: { createdAt: -1 } }
+    ];
+
+    const aggregatedTransactions = await transactionCollection.aggregate(pipeline).toArray();
+    return res.status(200).json(aggregatedTransactions);
+
+  } catch (error) {
+    console.error("❌ Failed compiling aggregated transaction ledger:", error);
+    return res.status(500).json({ error: "Internal ledger processing error" });
+  }
+});
+app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    if (!ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid Report ID formatting." });
+    }
+
+    const result = await reportCollection.deleteOne({
+      _id: new ObjectId(id),
+      reporterId: userId,
+      status: "pending",
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error:
+          "Report record could not be canceled. It may have already been resolved by admins.",
+      });
+    }
+
+    res
+      .status(200)
+      .json({ success: true, message: "Report successfully withdrawn." });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// =========================================================================
+// SERVER START
+// =========================================================================
 app.listen(PORT, () => {
   console.log(`Backend Express Hub running smoothly on port: ${PORT}`);
 });
