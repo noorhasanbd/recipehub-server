@@ -57,7 +57,7 @@ app.post(
       event = stripe.webhooks.constructEvent(
         req.body,
         signature,
-        process.env.STRIPE_WEBHOOK_SECRET
+        process.env.STRIPE_WEBHOOK_SECRET,
       );
     } catch (err) {
       console.error(`❌ Webhook cryptographic validation failed:`, err.message);
@@ -66,7 +66,7 @@ app.post(
 
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
-      
+
       // Extract metadata sent over from your Next.js route handlers
       const userId = session.metadata?.userId;
       const recipeId = session.metadata?.recipeId;
@@ -88,41 +88,46 @@ app.post(
           // -----------------------------------------------------------------
           if (purchaseType === "single_recipe_purchase") {
             if (!recipeId) {
-              console.error("❌ Missing recipeId in webhook session metadata payload");
-              return res.status(400).json({ error: "Missing recipeId in session metadata" });
+              console.error(
+                "❌ Missing recipeId in webhook session metadata payload",
+              );
+              return res
+                .status(400)
+                .json({ error: "Missing recipeId in session metadata" });
             }
 
             // Up-to-date syntax mapping tracking mutations cleanly
             await recipePurchaseCollection.updateOne(
               { userId: userId, recipeId: recipeId },
-              { 
-                $set: { 
-                  userId: userId, 
-                  recipeId: recipeId, 
-                  purchasedAt: new Date() 
-                } 
-              },
-              { upsert: true }
-            );
-
-            console.log(`💾 MongoDB Webhook Sync Success. Recipe ${recipeId} added to User ${userId}.`);
-
-          // -----------------------------------------------------------------
-          // ROUTE B: SUBSCRIPTION TIER MEMBER ELEVATION
-          // -----------------------------------------------------------------
-          } else {
-            await userCollection.updateOne(
-              queryTarget,
               {
                 $set: {
-                  isPremium: true,
-                  stripeSubscriptionId: stripeSubscriptionId,
-                  updatedAt: new Date(),
+                  userId: userId,
+                  recipeId: recipeId,
+                  purchasedAt: new Date(),
                 },
               },
+              { upsert: true },
             );
 
-            console.log(`💾 MongoDB Webhook Sync Success. User ${userId} upgraded to Premium.`);
+            console.log(
+              `💾 MongoDB Webhook Sync Success. Recipe ${recipeId} added to User ${userId}.`,
+            );
+
+            // -----------------------------------------------------------------
+            // ROUTE B: SUBSCRIPTION TIER MEMBER ELEVATION
+            // -----------------------------------------------------------------
+          } else {
+            await userCollection.updateOne(queryTarget, {
+              $set: {
+                isPremium: true,
+                stripeSubscriptionId: stripeSubscriptionId,
+                updatedAt: new Date(),
+              },
+            });
+
+            console.log(
+              `💾 MongoDB Webhook Sync Success. User ${userId} upgraded to Premium.`,
+            );
           }
 
           // -----------------------------------------------------------------
@@ -130,9 +135,10 @@ app.post(
           // -----------------------------------------------------------------
           const webhookTransaction = {
             userId: userId,
-            recipeId: recipeId || null, 
-            purchaseType: purchaseType || "subscription", 
-            customerEmail: session.customer_details?.email || session.customer_email,
+            recipeId: recipeId || null,
+            purchaseType: purchaseType || "subscription",
+            customerEmail:
+              session.customer_details?.email || session.customer_email,
             stripeSessionId: session.id,
             stripeSubscriptionId: session.subscription || null,
             amountTotal: session.amount_total / 100,
@@ -147,17 +153,23 @@ app.post(
             { upsert: true },
           );
 
-          console.log(`💾 Ledger entry recorded for session token: ${session.id}`);
-
+          console.log(
+            `💾 Ledger entry recorded for session token: ${session.id}`,
+          );
         } catch (dbErr) {
-          console.error("❌ Database mutations dropped during webhook processing:", dbErr);
-          return res.status(500).json({ error: "Internal database tracking fault." });
+          console.error(
+            "❌ Database mutations dropped during webhook processing:",
+            dbErr,
+          );
+          return res
+            .status(500)
+            .json({ error: "Internal database tracking fault." });
         }
       }
     }
 
     res.status(200).json({ received: true });
-  }
+  },
 );
 
 // =========================================================================
@@ -174,13 +186,15 @@ app.post("/api/payments/verify-session", async (req, res) => {
     const { sessionId } = req.body;
 
     if (!sessionId) {
-      return res.status(400).json({ success: false, error: "Missing sessionId parameters" });
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing sessionId parameters" });
     }
 
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     const userId = session.metadata?.userId;
-    const recipeId = session.metadata?.recipeId; 
-    const purchaseType = session.metadata?.type; 
+    const recipeId = session.metadata?.recipeId;
+    const purchaseType = session.metadata?.type;
 
     if (!userId) {
       return res.status(400).json({
@@ -199,42 +213,46 @@ app.post("/api/payments/verify-session", async (req, res) => {
     // 🌟 ROUTE 1: SINGLE RECIPE PURCHASE LOGIC
     if (purchaseType === "single_recipe_purchase") {
       if (!recipeId) {
-        return res.status(400).json({ success: false, error: "Missing recipeId in session metadata" });
+        return res.status(400).json({
+          success: false,
+          error: "Missing recipeId in session metadata",
+        });
       }
 
       await recipePurchaseCollection.updateOne(
         { userId: userId, recipeId: recipeId },
-        { 
-          $set: { 
-            userId: userId, 
-            recipeId: recipeId, 
-            purchasedAt: new Date() 
-          } 
-        },
-        { upsert: true }
-      );
-      
-      console.log(`💾 Express Inline Verification Active. Recipe ${recipeId} unlocked for User ${userId}.`);
-
-    // 🌟 ROUTE 2: ORIGINAL SUBSCRIPTION LOGIC
-    } else {
-      await userCollection.updateOne(
-        queryTarget,
         {
           $set: {
-            isPremium: true,
-            stripeSubscriptionId: session.subscription,
-            updatedAt: new Date(),
+            userId: userId,
+            recipeId: recipeId,
+            purchasedAt: new Date(),
           },
         },
+        { upsert: true },
       );
-      console.log(`💾 Express Inline Verification Active. User ${userId} updated to Premium.`);
+
+      console.log(
+        `💾 Express Inline Verification Active. Recipe ${recipeId} unlocked for User ${userId}.`,
+      );
+
+      // 🌟 ROUTE 2: ORIGINAL SUBSCRIPTION LOGIC
+    } else {
+      await userCollection.updateOne(queryTarget, {
+        $set: {
+          isPremium: true,
+          stripeSubscriptionId: session.subscription,
+          updatedAt: new Date(),
+        },
+      });
+      console.log(
+        `💾 Express Inline Verification Active. User ${userId} updated to Premium.`,
+      );
     }
 
-    // 📝 ALWAYS RECORD THE TRANSACTION 
+    // 📝 ALWAYS RECORD THE TRANSACTION
     const transactionRecord = {
       userId: userId,
-      recipeId: recipeId || null, 
+      recipeId: recipeId || null,
       purchaseType: purchaseType || "subscription",
       customerEmail: session.customer_details?.email || session.customer_email,
       stripeSessionId: session.id,
@@ -251,7 +269,9 @@ app.post("/api/payments/verify-session", async (req, res) => {
       { upsert: true },
     );
 
-    return res.status(200).json({ success: true, message: "Database synchronized successfully" });
+    return res
+      .status(200)
+      .json({ success: true, message: "Database synchronized successfully" });
   } catch (error) {
     console.error("❌ Express side verify-session route failure:", error);
     return res.status(500).json({ success: false, error: error.message });
@@ -960,24 +980,26 @@ app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
  */
 app.post("/api/recipes/:id/favorite", isAuthenticated, async (req, res) => {
   try {
-    const { id: recipeId } = req.params;
+    const { id: recipeIdStr } = req.params;
     const userId = req.user.id;
 
-    if (!ObjectId.isValid(recipeId)) {
+    if (!ObjectId.isValid(recipeIdStr)) {
       return res
         .status(400)
         .json({ success: false, error: "Invalid recipe ID format." });
     }
 
-    const recipe = await recipeCollection.findOne({
-      _id: new ObjectId(recipeId),
-    });
+    // 🌟 FIX: Convert string to native ObjectId right away
+    const recipeId = new ObjectId(recipeIdStr);
+
+    const recipe = await recipeCollection.findOne({ _id: recipeId });
     if (!recipe) {
       return res
         .status(404)
         .json({ success: false, error: "Recipe not found." });
     }
 
+    // Now queries and mutations use the structured ObjectId uniformly
     const existingFavorite = await favoriteCollection.findOne({
       userId,
       recipeId,
@@ -1006,14 +1028,17 @@ app.post("/api/recipes/:id/favorite", isAuthenticated, async (req, res) => {
  */
 app.delete("/api/recipes/:id/favorite", isAuthenticated, async (req, res) => {
   try {
-    const { id: recipeId } = req.params;
+    const { id: recipeIdStr } = req.params;
     const userId = req.user.id;
 
-    if (!ObjectId.isValid(recipeId)) {
+    if (!ObjectId.isValid(recipeIdStr)) {
       return res
         .status(400)
         .json({ success: false, error: "Invalid recipe ID format." });
     }
+
+    // 🌟 FIX: Convert string to native ObjectId here too
+    const recipeId = new ObjectId(recipeIdStr);
 
     const result = await favoriteCollection.deleteOne({ userId, recipeId });
 
@@ -1023,14 +1048,64 @@ app.delete("/api/recipes/:id/favorite", isAuthenticated, async (req, res) => {
         .json({ success: false, error: "Favorite record not found." });
     }
 
-    res
-      .status(200)
-      .json({
-        success: true,
-        message: "Successfully removed from favorites collection.",
-      });
+    res.status(200).json({
+      success: true,
+      message: "Successfully removed from favorites collection.",
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/api/payments/user-recipes/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: "Authenticated user reference ID is omitted.",
+      });
+    }
+
+    // Pipeline performing lookups by converting string recipeId mappings to ObjectIds safely
+    const pipeline = [
+      { $match: { userId: userId } },
+      {
+        $addFields: {
+          recipeObjectId: {
+            $convert: {
+              input: "$recipeId",
+              to: "objectId",
+              onError: null,
+              onNull: null,
+            },
+          },
+        },
+      },
+      {
+        $lookup: {
+          from: "recipes",
+          localField: "recipeObjectId",
+          foreignField: "_id",
+          as: "recipeDetails",
+        },
+      },
+      { $unwind: "$recipeDetails" },
+      { $replaceRoot: { newRoot: "$recipeDetails" } },
+    ];
+
+    const purchasedRecipes = await recipePurchaseCollection
+      .aggregate(pipeline)
+      .toArray();
+
+    return res.status(200).json({ success: true, data: purchasedRecipes });
+  } catch (err) {
+    console.error(
+      "❌ Express failed fetching items from recipepurchase collection:",
+      err,
+    );
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -1044,32 +1119,48 @@ app.get("/api/recipes/favorites/my-list", isAuthenticated, async (req, res) => {
 
     const favoriteRecipes = await favoriteCollection
       .aggregate([
+        // 1. Get all favorite tracking entries for the user
         { $match: { userId: userId } },
-        {
-          $addFields: {
-            recipeObjectId: { $toObjectId: "$recipeId" },
-          },
-        },
+
+        // 2. 🌟 HYBRID LOOKUP: Matches whether recipeId is a String OR an ObjectId!
         {
           $lookup: {
             from: "recipes",
-            localField: "recipeObjectId",
-            foreignField: "_id",
+            let: { favRecipeId: "$recipeId" },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $or: [
+                      // Match if both are ObjectIds
+                      { $eq: ["$_id", "$$favRecipeId"] },
+                      // Match if your DB has a string but recipes uses ObjectId
+                      { $eq: ["$_id", { $toObjectId: "$$favRecipeId" }] },
+                      // Match if recipes collection ID matches string representation
+                      { $eq: [{ $toString: "$_id" }, "$$favRecipeId"] },
+                    ],
+                  },
+                },
+              },
+            ],
             as: "recipeDetails",
           },
         },
+
+        // 3. Flatten the joined metadata array
         { $unwind: "$recipeDetails" },
-        { $replaceRoot: { newRoot: "$recipeDetails" } }
+
+        // 4. Shift recipe metadata properties up to the top level root
+        { $replaceRoot: { newRoot: "$recipeDetails" } },
       ])
       .toArray();
 
     return res.status(200).json({ success: true, data: favoriteRecipes });
   } catch (error) {
-    console.error("❌ Get favorites list failure:", error);
+    console.error("❌ Get favorites list aggregation failure:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
 app.listen(PORT, () => {
   console.log(`Server running safely on port ${PORT}`);
 });
