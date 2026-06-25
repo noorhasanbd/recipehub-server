@@ -24,27 +24,26 @@ app.use(
   cors({
     origin: process.env.FRONTEND_URL || "http://localhost:3000",
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
-    credentials: true, // Allows secure cookie tokens to cross origin boundaries
+    credentials: true,
   }),
 );
 
-// DB Connections
+// DB Connections - Top-level await is completely fine in Vercel Node.js 18+
 const client = new MongoClient(process.env.MONGODB_URI);
 await client.connect();
 const db = client.db(process.env.DB_NAME || "recipehub-db");
 
 // Collections
-const userCollection = db.collection("user"); // Aligned with your system user identity mapping
+const userCollection = db.collection("user");
 const recipeCollection = db.collection("recipes");
 const reportCollection = db.collection("reports");
-const transactionCollection = db.collection("transactions"); // 🌟 NEW ADDITION: For admin revenue visibility logs
+const transactionCollection = db.collection("transactions");
 
 console.log("Connected cleanly to MongoDB Cluster Node Layer.");
 
 // =========================================================================
 // 2. BULLETPROOF STRIPE BACKGROUND WEBHOOK RECEIVER
 // =========================================================================
-// 🌟 CRITICAL: Must be registered BEFORE express.json() to capture raw request buffers!
 app.post(
   "/api/stripe/webhook",
   express.raw({ type: "application/json" }),
@@ -70,7 +69,6 @@ app.post(
 
       if (userId) {
         try {
-          // Handles flexible index structural mutations mapping directly to Better-Auth user schema
           await userCollection.updateOne(
             {
               $or: [
@@ -87,7 +85,6 @@ app.post(
             },
           );
 
-          // 🌟 NEW ADDITION: Log transaction in webhook as fallback security redundancy
           const webhookTransaction = {
             userId: userId,
             customerEmail:
@@ -126,13 +123,13 @@ app.post(
 );
 
 // =========================================================================
-// 3. STANDARD PARSING MIDDLEWARES (Safe down here)
+// 3. STANDARD PARSING MIDDLEWARES
 // =========================================================================
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // =========================================================================
-// 🌟 NEW ADDITION: NEXT.JS SERVER ACTION VERIFICATION ROUTE
+// NEXT.JS SERVER ACTION VERIFICATION ROUTE
 // =========================================================================
 app.post("/api/payments/verify-session", async (req, res) => {
   try {
@@ -144,7 +141,6 @@ app.post("/api/payments/verify-session", async (req, res) => {
         .json({ success: false, error: "Missing sessionId parameters" });
     }
 
-    // 1. Pull the actual object securely directly from Stripe
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     const userId = session.metadata?.userId;
 
@@ -157,7 +153,6 @@ app.post("/api/payments/verify-session", async (req, res) => {
         });
     }
 
-    // 2. Perform target user level modification mutation
     await userCollection.updateOne(
       {
         $or: [
@@ -174,19 +169,17 @@ app.post("/api/payments/verify-session", async (req, res) => {
       },
     );
 
-    // 3. Document explicit transaction log for your upcoming Admin view charts
     const transactionRecord = {
       userId: userId,
       customerEmail: session.customer_details?.email || session.customer_email,
       stripeSessionId: session.id,
       stripeSubscriptionId: session.subscription,
-      amountTotal: session.amount_total / 100, // convert from cents to base units
+      amountTotal: session.amount_total / 100,
       currency: session.currency?.toUpperCase(),
       paymentStatus: session.payment_status,
       createdAt: new Date(),
     };
 
-    // Prevent duplicate entries using custom upsert pattern
     await transactionCollection.updateOne(
       { stripeSessionId: session.id },
       { $set: transactionRecord },
@@ -226,10 +219,7 @@ app.post("/api/checkout_sessions", async (req, res) => {
     };
 
     if (customer_email) sessionConfig.customer_email = customer_email;
-
-    if (user_id) {
-      sessionConfig.metadata = { userId: user_id };
-    }
+    if (user_id) sessionConfig.metadata = { userId: user_id };
 
     const session = await stripe.checkout.sessions.create(sessionConfig);
     return res.redirect(303, session.url);
@@ -240,43 +230,21 @@ app.post("/api/checkout_sessions", async (req, res) => {
 });
 
 // =========================================================================
-// 5. BETTER AUTH CONFIGURATION (WITH CROSS-ORIGIN MATRIX ALIGNMENT)
+// 5. BETTER AUTH CONFIGURATION
 // =========================================================================
 export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL || "http://localhost:5000",
-  database: mongodbAdapter(db, {
-    client,
-  }),
-  emailAndPassword: {
-    enabled: true,
-  },
-  advanced: {
-    crossOrigin: true,
-  },
+  database: mongodbAdapter(db, { client }),
+  emailAndPassword: { enabled: true },
+  advanced: { crossOrigin: true },
   trustedOrigins: ["http://localhost:3000", "http://localhost:5000"],
-  cookie: {
-    sameSite: "none",
-    secure: false,
-  },
+  cookie: { sameSite: "none", secure: false },
   user: {
     additionalFields: {
-      role: {
-        type: "string",
-        defaultValue: "user",
-      },
-      isPremium: {
-        type: "boolean",
-        defaultValue: false,
-      },
-      isBlocked: {
-        type: "boolean",
-        defaultValue: false,
-        input: true,
-      },
-      stripeSubscriptionId: {
-        type: "string",
-        defaultValue: "",
-      },
+      role: { type: "string", defaultValue: "user" },
+      isPremium: { type: "boolean", defaultValue: false },
+      isBlocked: { type: "boolean", defaultValue: false, input: true },
+      stripeSubscriptionId: { type: "string", defaultValue: "" },
     },
   },
 });
@@ -286,7 +254,6 @@ app.all("/api/auth/*any", toNodeHandler(auth));
 const isAuthenticated = async (req, res, next) => {
   try {
     const webHeaders = new Headers();
-
     Object.entries(req.headers).forEach(([key, value]) => {
       if (value) {
         if (Array.isArray(value)) {
@@ -297,10 +264,7 @@ const isAuthenticated = async (req, res, next) => {
       }
     });
 
-    const session = await auth.api.getSession({
-      headers: webHeaders,
-    });
-
+    const session = await auth.api.getSession({ headers: webHeaders });
     if (!session || !session.user) {
       return res.status(401).json({
         success: false,
@@ -328,7 +292,6 @@ app.get("/", async (req, res) => {
 app.post("/api/recipes", async (req, res) => {
   try {
     const activeUser = req.body.clientUser;
-
     if (!activeUser) {
       return res.status(401).json({
         success: false,
@@ -337,7 +300,6 @@ app.post("/api/recipes", async (req, res) => {
     }
 
     const { clientUser, ...recipeData } = req.body;
-
     const newRecipe = {
       ...recipeData,
       authorId: activeUser.id,
@@ -376,7 +338,6 @@ app.get("/api/recipes", async (req, res) => {
     } = req.query;
 
     const filters = {};
-
     if (category) filters.category = category;
     if (cuisineType) filters.cuisineType = cuisineType;
     if (difficultyLevel) filters.difficultyLevel = difficultyLevel;
@@ -385,7 +346,6 @@ app.get("/api/recipes", async (req, res) => {
     if (isFeatured) filters.isFeatured = isFeatured === "true";
 
     const totalItems = await recipeCollection.countDocuments(filters);
-
     const recipes = await recipeCollection
       .find(filters)
       .sort({ createdAt: -1 })
@@ -628,7 +588,6 @@ app.patch("/api/admin/users/:id/status", async (req, res) => {
     }
 
     const targetNewStatus = !currentStatus;
-
     const result = await userCollection.updateOne(
       { _id: new ObjectId(userId) },
       { $set: { isBlocked: targetNewStatus } },
@@ -720,7 +679,6 @@ app.get("/api/recipes/user/:userId", async (req, res) => {
 app.post("/api/reports", isAuthenticated, async (req, res) => {
   try {
     const { targetType, targetId, targetName, reason, details } = req.body;
-
     const reporterId = req.user.id;
     const reporterName = req.user.name;
 
@@ -745,7 +703,6 @@ app.post("/api/reports", isAuthenticated, async (req, res) => {
     };
 
     const result = await reportCollection.insertOne(newReport);
-
     res.status(201).json({
       success: true,
       data: { _id: result.insertedId, ...newReport },
@@ -758,7 +715,6 @@ app.post("/api/reports", isAuthenticated, async (req, res) => {
 app.get("/api/reports/my-history", isAuthenticated, async (req, res) => {
   try {
     const userId = req.user.id;
-
     const userReports = await reportCollection
       .find({ reporterId: userId })
       .sort({ createdAt: -1 })
@@ -834,11 +790,9 @@ app.patch("/api/reports/:id/status", async (req, res) => {
   }
 });
 
-// 🌟 UPDATED EXPRESS ENDPOINT: Aggregating Transactions with User Profiles
 app.get("/api/all-transactions", async (req, res) => {
   try {
     const pipeline = [
-      // 1. Join user details using a flexible conditional type comparison match
       {
         $lookup: {
           from: "user",
@@ -848,9 +802,7 @@ app.get("/api/all-transactions", async (req, res) => {
               $match: {
                 $expr: {
                   $or: [
-                    // Match case A: Both are matching standard Strings (e.g., user.id === transaction.userId)
                     { $eq: ["$id", "$$trxUserId"] },
-                    // Match case B: Convert the transaction string to an ObjectId to compare against user._id
                     {
                       $eq: [
                         "$_id",
@@ -858,28 +810,26 @@ app.get("/api/all-transactions", async (req, res) => {
                           $convert: {
                             input: "$$trxUserId",
                             to: "objectId",
-                            onError: null, // If conversion fails (e.g. invalid format), returns null cleanly
-                            onNull: null
-                          }
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            }
+                            onError: null,
+                            onNull: null,
+                          },
+                        },
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
           ],
-          as: "userDetails"
-        }
+          as: "userDetails",
+        },
       },
-      // 2. Unwind the userDetails array
       {
         $unwind: {
           path: "$userDetails",
-          preserveNullAndEmptyArrays: true
-        }
+          preserveNullAndEmptyArrays: true,
+        },
       },
-      // 3. Reshape output data structures
       {
         $project: {
           _id: 1,
@@ -891,21 +841,20 @@ app.get("/api/all-transactions", async (req, res) => {
           currency: 1,
           paymentStatus: 1,
           createdAt: 1,
-          // Extract user name cleanly or fall back gracefully
-          userName: { $ifNull: ["$userDetails.name", "Unknown User"] }
-        }
+          userName: { $ifNull: ["$userDetails.name", "Unknown User"] },
+        },
       },
-      { $sort: { createdAt: -1 } }
+      { $sort: { createdAt: -1 } },
     ];
 
     const aggregatedTransactions = await transactionCollection.aggregate(pipeline).toArray();
     return res.status(200).json(aggregatedTransactions);
-
   } catch (error) {
     console.error("❌ Failed compiling aggregated transaction ledger:", error);
     return res.status(500).json({ error: "Internal ledger processing error" });
   }
 });
+
 app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
   try {
     const { id } = req.params;
@@ -926,8 +875,7 @@ app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
     if (result.deletedCount === 0) {
       return res.status(404).json({
         success: false,
-        error:
-          "Report record could not be canceled. It may have already been resolved by admins.",
+        error: "Report record could not be canceled. It may have already been resolved by admins.",
       });
     }
 
@@ -940,8 +888,13 @@ app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
 });
 
 // =========================================================================
-// SERVER START
+// 9. CONDITIONAL SERVER START FOR DUAL LOCAL/PRODUCTION ENVIRONMENTS
 // =========================================================================
-app.listen(PORT, () => {
-  console.log(`Backend Express Hub running smoothly on port: ${PORT}`);
-});
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`Backend Express Hub running smoothly on local port: ${PORT}`);
+  });
+}
+
+// 🌟 REQUIRED DEFAULT EXPORT VECTOR FOR VERCEL SERVERLESS LOGIC LAYER
+export default app;
