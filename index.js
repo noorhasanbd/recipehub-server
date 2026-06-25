@@ -39,6 +39,7 @@ const recipeCollection = db.collection("recipes");
 const reportCollection = db.collection("reports");
 const transactionCollection = db.collection("transactions");
 const favoriteCollection = db.collection("favorites");
+const recipePurchaseCollection = db.collection("recipepurchase"); // 🌟 Collection Declared Cleanly
 
 console.log("Connected cleanly to MongoDB Cluster Node Layer.");
 
@@ -56,7 +57,7 @@ app.post(
       event = stripe.webhooks.constructEvent(
         req.body,
         signature,
-        process.env.STRIPE_WEBHOOK_SECRET,
+        process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
       console.error(`❌ Webhook cryptographic validation failed:`, err.message);
@@ -65,33 +66,75 @@ app.post(
 
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
+      
+      // Extract metadata sent over from your Next.js route handlers
       const userId = session.metadata?.userId;
+      const recipeId = session.metadata?.recipeId;
+      const purchaseType = session.metadata?.type; // 'single_recipe_purchase' vs 'subscription'
       const stripeSubscriptionId = session.subscription;
 
       if (userId) {
         try {
-          await userCollection.updateOne(
-            {
-              $or: [
-                { _id: userId },
-                { _id: ObjectId.isValid(userId) ? new ObjectId(userId) : null },
-              ].filter(Boolean),
-            },
-            {
-              $set: {
-                isPremium: true,
-                stripeSubscriptionId: stripeSubscriptionId,
-                updatedAt: new Date(),
-              },
-            },
-          );
+          // Construct targeted user filter fallback array matches
+          const queryTarget = {
+            $or: [
+              { _id: userId },
+              { _id: ObjectId.isValid(userId) ? new ObjectId(userId) : null },
+            ].filter(Boolean),
+          };
 
+          // -----------------------------------------------------------------
+          // ROUTE A: ONE-TIME SINGLE RECIPE ACCESS PROVISIONS
+          // -----------------------------------------------------------------
+          if (purchaseType === "single_recipe_purchase") {
+            if (!recipeId) {
+              console.error("❌ Missing recipeId in webhook session metadata payload");
+              return res.status(400).json({ error: "Missing recipeId in session metadata" });
+            }
+
+            // Up-to-date syntax mapping tracking mutations cleanly
+            await recipePurchaseCollection.updateOne(
+              { userId: userId, recipeId: recipeId },
+              { 
+                $set: { 
+                  userId: userId, 
+                  recipeId: recipeId, 
+                  purchasedAt: new Date() 
+                } 
+              },
+              { upsert: true }
+            );
+
+            console.log(`💾 MongoDB Webhook Sync Success. Recipe ${recipeId} added to User ${userId}.`);
+
+          // -----------------------------------------------------------------
+          // ROUTE B: SUBSCRIPTION TIER MEMBER ELEVATION
+          // -----------------------------------------------------------------
+          } else {
+            await userCollection.updateOne(
+              queryTarget,
+              {
+                $set: {
+                  isPremium: true,
+                  stripeSubscriptionId: stripeSubscriptionId,
+                  updatedAt: new Date(),
+                },
+              },
+            );
+
+            console.log(`💾 MongoDB Webhook Sync Success. User ${userId} upgraded to Premium.`);
+          }
+
+          // -----------------------------------------------------------------
+          // NATIVE AUDITING: RECORD COMPREHENSIVE TRANSACTION METRICS
+          // -----------------------------------------------------------------
           const webhookTransaction = {
             userId: userId,
-            customerEmail:
-              session.customer_details?.email || session.customer_email,
+            recipeId: recipeId || null, 
+            purchaseType: purchaseType || "subscription", 
+            customerEmail: session.customer_details?.email || session.customer_email,
             stripeSessionId: session.id,
-            stripeSubscriptionId: session.subscription,
+            stripeSubscriptionId: session.subscription || null,
             amountTotal: session.amount_total / 100,
             currency: session.currency?.toUpperCase(),
             paymentStatus: session.payment_status,
@@ -104,23 +147,17 @@ app.post(
             { upsert: true },
           );
 
-          console.log(
-            `💾 MongoDB Webhook Sync Success. User ${userId} upgraded to Premium.`,
-          );
+          console.log(`💾 Ledger entry recorded for session token: ${session.id}`);
+
         } catch (dbErr) {
-          console.error(
-            "❌ Database mutations dropped during webhook processing:",
-            dbErr,
-          );
-          return res
-            .status(500)
-            .json({ error: "Internal database tracking fault." });
+          console.error("❌ Database mutations dropped during webhook processing:", dbErr);
+          return res.status(500).json({ error: "Internal database tracking fault." });
         }
       }
     }
 
     res.status(200).json({ received: true });
-  },
+  }
 );
 
 // =========================================================================
@@ -137,13 +174,13 @@ app.post("/api/payments/verify-session", async (req, res) => {
     const { sessionId } = req.body;
 
     if (!sessionId) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Missing sessionId parameters" });
+      return res.status(400).json({ success: false, error: "Missing sessionId parameters" });
     }
 
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     const userId = session.metadata?.userId;
+    const recipeId = session.metadata?.recipeId; 
+    const purchaseType = session.metadata?.type; 
 
     if (!userId) {
       return res.status(400).json({
@@ -152,27 +189,56 @@ app.post("/api/payments/verify-session", async (req, res) => {
       });
     }
 
-    await userCollection.updateOne(
-      {
-        $or: [
-          { _id: userId },
-          { _id: ObjectId.isValid(userId) ? new ObjectId(userId) : null },
-        ].filter(Boolean),
-      },
-      {
-        $set: {
-          isPremium: true,
-          stripeSubscriptionId: session.subscription,
-          updatedAt: new Date(),
-        },
-      },
-    );
+    const queryTarget = {
+      $or: [
+        { _id: userId },
+        { _id: ObjectId.isValid(userId) ? new ObjectId(userId) : null },
+      ].filter(Boolean),
+    };
 
+    // 🌟 ROUTE 1: SINGLE RECIPE PURCHASE LOGIC
+    if (purchaseType === "single_recipe_purchase") {
+      if (!recipeId) {
+        return res.status(400).json({ success: false, error: "Missing recipeId in session metadata" });
+      }
+
+      await recipePurchaseCollection.updateOne(
+        { userId: userId, recipeId: recipeId },
+        { 
+          $set: { 
+            userId: userId, 
+            recipeId: recipeId, 
+            purchasedAt: new Date() 
+          } 
+        },
+        { upsert: true }
+      );
+      
+      console.log(`💾 Express Inline Verification Active. Recipe ${recipeId} unlocked for User ${userId}.`);
+
+    // 🌟 ROUTE 2: ORIGINAL SUBSCRIPTION LOGIC
+    } else {
+      await userCollection.updateOne(
+        queryTarget,
+        {
+          $set: {
+            isPremium: true,
+            stripeSubscriptionId: session.subscription,
+            updatedAt: new Date(),
+          },
+        },
+      );
+      console.log(`💾 Express Inline Verification Active. User ${userId} updated to Premium.`);
+    }
+
+    // 📝 ALWAYS RECORD THE TRANSACTION 
     const transactionRecord = {
       userId: userId,
+      recipeId: recipeId || null, 
+      purchaseType: purchaseType || "subscription",
       customerEmail: session.customer_details?.email || session.customer_email,
       stripeSessionId: session.id,
-      stripeSubscriptionId: session.subscription,
+      stripeSubscriptionId: session.subscription || null,
       amountTotal: session.amount_total / 100,
       currency: session.currency?.toUpperCase(),
       paymentStatus: session.payment_status,
@@ -185,12 +251,7 @@ app.post("/api/payments/verify-session", async (req, res) => {
       { upsert: true },
     );
 
-    console.log(
-      `💾 Express Inline Verification Active. User ${userId} updated & transaction recorded.`,
-    );
-    return res
-      .status(200)
-      .json({ success: true, message: "Database synchronized successfully" });
+    return res.status(200).json({ success: true, message: "Database synchronized successfully" });
   } catch (error) {
     console.error("❌ Express side verify-session route failure:", error);
     return res.status(500).json({ success: false, error: error.message });
@@ -822,7 +883,7 @@ app.get("/api/all-transactions", async (req, res) => {
           ],
           as: "userDetails",
         },
-      },
+      }, // ✅ FIXED: Nesting closed correctly here
       {
         $unwind: {
           path: "$userDetails",
@@ -888,6 +949,7 @@ app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
 // =========================================================================
 // 6b. DEDICATED FAVORITES COLLECTION ENDPOINTS
 // =========================================================================
@@ -907,7 +969,6 @@ app.post("/api/recipes/:id/favorite", isAuthenticated, async (req, res) => {
         .json({ success: false, error: "Invalid recipe ID format." });
     }
 
-    // Verify recipe exists
     const recipe = await recipeCollection.findOne({
       _id: new ObjectId(recipeId),
     });
@@ -917,18 +978,15 @@ app.post("/api/recipes/:id/favorite", isAuthenticated, async (req, res) => {
         .json({ success: false, error: "Recipe not found." });
     }
 
-    // Check if the link record already exists
     const existingFavorite = await favoriteCollection.findOne({
       userId,
       recipeId,
     });
 
     if (existingFavorite) {
-      // ❌ REMOVE: Delete the mapping record entirely
       await favoriteCollection.deleteOne({ userId, recipeId });
       return res.status(200).json({ success: true, isFavorited: false });
     } else {
-      // ✅ ADD: Create a fresh favorite document entry
       await favoriteCollection.insertOne({
         userId,
         recipeId,
@@ -984,7 +1042,6 @@ app.get("/api/recipes/favorites/my-list", isAuthenticated, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Use aggregation to join the favorites collection with the recipes collection
     const favoriteRecipes = await favoriteCollection
       .aggregate([
         { $match: { userId: userId } },
@@ -1002,29 +1059,17 @@ app.get("/api/recipes/favorites/my-list", isAuthenticated, async (req, res) => {
           },
         },
         { $unwind: "$recipeDetails" },
-        { $sort: { createdAt: -1 } }, // Sort by newest bookmark date
-        { $replaceRoot: { newRoot: "$recipeDetails" } }, // Output the raw recipe items directly
+        { $replaceRoot: { newRoot: "$recipeDetails" } }
       ])
       .toArray();
 
-    res.status(200).json({
-      success: true,
-      favorites: favoriteRecipes,
-    });
+    return res.status(200).json({ success: true, data: favoriteRecipes });
   } catch (error) {
-    console.error("❌ Fetch Favorites List Pipeline Error:", error);
+    console.error("❌ Get favorites list failure:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// =========================================================================
-// 9. CONDITIONAL SERVER START FOR DUAL LOCAL/PRODUCTION ENVIRONMENTS
-// =========================================================================
-if (process.env.NODE_ENV !== "production") {
-  app.listen(PORT, () => {
-    console.log(`Backend Express Hub running smoothly on local port: ${PORT}`);
-  });
-}
-
-// 🌟 REQUIRED DEFAULT EXPORT VECTOR FOR VERCEL SERVERLESS LOGIC LAYER
-export default app;
+app.listen(PORT, () => {
+  console.log(`Server running safely on port ${PORT}`);
+});
