@@ -1176,4 +1176,4 @@ if (process.env.NODE_ENV !== 'production') {
 
 // 🌟 CRITICAL FIX FOR VERCEL DEPLOYMENT:
 module.exports = app;
-
+export default app;
