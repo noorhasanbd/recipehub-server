@@ -1161,12 +1161,11 @@ app.get("/api/recipes/favorites/my-list", isAuthenticated, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-app.listen(PORT, () => {
-  console.log(`Server running safely on port ${PORT}`);
-});
-// ... Your middleware, DB connections, and API routes go here ...
+// =========================================================================
+// SERVER STARTUP — fixed for Vercel
+// =========================================================================
 
-// Only start the standalone listener if running locally (not on Vercel production edge layers)
+// Only bind a port when running locally — Vercel does NOT call app.listen()
 if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => {
@@ -1174,6 +1173,5 @@ if (process.env.NODE_ENV !== 'production') {
   });
 }
 
-// 🌟 CRITICAL FIX FOR VERCEL DEPLOYMENT:
-module.exports = app;
+// Single default export only — no module.exports mixed in
 export default app;
