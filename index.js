@@ -38,6 +38,7 @@ const userCollection = db.collection("user");
 const recipeCollection = db.collection("recipes");
 const reportCollection = db.collection("reports");
 const transactionCollection = db.collection("transactions");
+const favoriteCollection = db.collection("favorites");
 
 console.log("Connected cleanly to MongoDB Cluster Node Layer.");
 
@@ -145,12 +146,10 @@ app.post("/api/payments/verify-session", async (req, res) => {
     const userId = session.metadata?.userId;
 
     if (!userId) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: "No userId embedded in checkout session metadata",
-        });
+      return res.status(400).json({
+        success: false,
+        error: "No userId embedded in checkout session metadata",
+      });
     }
 
     await userCollection.updateOne(
@@ -847,7 +846,9 @@ app.get("/api/all-transactions", async (req, res) => {
       { $sort: { createdAt: -1 } },
     ];
 
-    const aggregatedTransactions = await transactionCollection.aggregate(pipeline).toArray();
+    const aggregatedTransactions = await transactionCollection
+      .aggregate(pipeline)
+      .toArray();
     return res.status(200).json(aggregatedTransactions);
   } catch (error) {
     console.error("❌ Failed compiling aggregated transaction ledger:", error);
@@ -875,7 +876,8 @@ app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
     if (result.deletedCount === 0) {
       return res.status(404).json({
         success: false,
-        error: "Report record could not be canceled. It may have already been resolved by admins.",
+        error:
+          "Report record could not be canceled. It may have already been resolved by admins.",
       });
     }
 
@@ -883,6 +885,134 @@ app.delete("/api/reports/:id", isAuthenticated, async (req, res) => {
       .status(200)
       .json({ success: true, message: "Report successfully withdrawn." });
   } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+// =========================================================================
+// 6b. DEDICATED FAVORITES COLLECTION ENDPOINTS
+// =========================================================================
+
+/**
+ * 1. TOGGLE FAVORITE (Add or Remove dynamically via separate collection)
+ * Route: POST /api/recipes/:id/favorite
+ */
+app.post("/api/recipes/:id/favorite", isAuthenticated, async (req, res) => {
+  try {
+    const { id: recipeId } = req.params;
+    const userId = req.user.id;
+
+    if (!ObjectId.isValid(recipeId)) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid recipe ID format." });
+    }
+
+    // Verify recipe exists
+    const recipe = await recipeCollection.findOne({
+      _id: new ObjectId(recipeId),
+    });
+    if (!recipe) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Recipe not found." });
+    }
+
+    // Check if the link record already exists
+    const existingFavorite = await favoriteCollection.findOne({
+      userId,
+      recipeId,
+    });
+
+    if (existingFavorite) {
+      // ❌ REMOVE: Delete the mapping record entirely
+      await favoriteCollection.deleteOne({ userId, recipeId });
+      return res.status(200).json({ success: true, isFavorited: false });
+    } else {
+      // ✅ ADD: Create a fresh favorite document entry
+      await favoriteCollection.insertOne({
+        userId,
+        recipeId,
+        createdAt: new Date(),
+      });
+      return res.status(200).json({ success: true, isFavorited: true });
+    }
+  } catch (error) {
+    console.error("❌ Dedicated Toggle Favorite Error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * 2. EXPLICIT DELETE FROM FAVORITES
+ * Route: DELETE /api/recipes/:id/favorite
+ */
+app.delete("/api/recipes/:id/favorite", isAuthenticated, async (req, res) => {
+  try {
+    const { id: recipeId } = req.params;
+    const userId = req.user.id;
+
+    if (!ObjectId.isValid(recipeId)) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Invalid recipe ID format." });
+    }
+
+    const result = await favoriteCollection.deleteOne({ userId, recipeId });
+
+    if (result.deletedCount === 0) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Favorite record not found." });
+    }
+
+    res
+      .status(200)
+      .json({
+        success: true,
+        message: "Successfully removed from favorites collection.",
+      });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * 3. GET CURRENT USER'S FAVORITES LIST (Using an Aggregation Pipeline)
+ * Route: GET /api/recipes/favorites/my-list
+ */
+app.get("/api/recipes/favorites/my-list", isAuthenticated, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Use aggregation to join the favorites collection with the recipes collection
+    const favoriteRecipes = await favoriteCollection
+      .aggregate([
+        { $match: { userId: userId } },
+        {
+          $addFields: {
+            recipeObjectId: { $toObjectId: "$recipeId" },
+          },
+        },
+        {
+          $lookup: {
+            from: "recipes",
+            localField: "recipeObjectId",
+            foreignField: "_id",
+            as: "recipeDetails",
+          },
+        },
+        { $unwind: "$recipeDetails" },
+        { $sort: { createdAt: -1 } }, // Sort by newest bookmark date
+        { $replaceRoot: { newRoot: "$recipeDetails" } }, // Output the raw recipe items directly
+      ])
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      favorites: favoriteRecipes,
+    });
+  } catch (error) {
+    console.error("❌ Fetch Favorites List Pipeline Error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
